@@ -55,6 +55,7 @@ from torchvision.transforms import v2
 import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
 from sam3.train.masks_ops import rle_encode  # For encoding masks to RLE format
 
+import multiprocessing
 # Note: Evaluation modules (mAP, cgF1, NMS) are in validate_sam3_lora.py
 # Training only computes validation loss, following SAM3's approach
 
@@ -784,7 +785,8 @@ class SAM3TrainerNative:
         self.model = build_sam3_image_model(
             device=self.device.type,
             compile=False,
-            load_from_HF=True,  # Tries to download from HF if checkpoint_path is None
+            checkpoint_path = 'E:/AI/Sam/model/facebook/sam3/sam3.pt',
+            load_from_HF=False,  # Tries to download from HF if checkpoint_path is None
             bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
             eval_mode=False
         )
@@ -1224,6 +1226,7 @@ def launch_distributed_training(args):
 
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method('spawn', force=True)
     parser = argparse.ArgumentParser(
         description="Train SAM3 with LoRA",
         formatter_class=argparse.RawDescriptionHelpFormatter,
