@@ -35,6 +35,19 @@ from pathlib import Path
 import numpy as np
 from PIL import Image as PILImage
 import contextlib
+import multiprocessing
+
+# Set environment variables for Windows compatibility BEFORE any CUDA/Triton imports
+if os.name == 'nt':  # Windows
+    # Disable Triton compilation to avoid Windows TCC issues
+    os.environ['TRITON_CACHE_DIR'] = ''
+    os.environ['TRITON_DISABLE_COMPILE'] = '1'
+    
+    # Set multiprocessing start method for Windows compatibility
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Already set
 
 # Distributed training imports
 import torch.distributed as dist
@@ -55,7 +68,6 @@ from torchvision.transforms import v2
 import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
 from sam3.train.masks_ops import rle_encode  # For encoding masks to RLE format
 
-import multiprocessing
 # Note: Evaluation modules (mAP, cgF1, NMS) are in validate_sam3_lora.py
 # Training only computes validation loss, following SAM3's approach
 
@@ -216,7 +228,26 @@ class COCOSegmentDataset(Dataset):
                     # Check if it's RLE format (dict) or polygon format (list)
                     if isinstance(segmentation, dict):
                         # RLE format: {"counts": "...", "size": [h, w]}
-                        mask_np = mask_utils.decode(segmentation)
+                        # mask_np = mask_utils.decode(segmentation)
+
+                        # RLE format: {"counts": "...", "size": [h, w]}
+                        counts = segmentation["counts"]
+                        if isinstance(counts, list):
+                            # 如果是列表形式，需要转换为 pycocotools 可接受的格式
+                            # 创建 RLE 对象并解码
+                            rle_obj = mask_utils.frPyObjects([segmentation], 
+                                                        segmentation['size'][0], 
+                                                        segmentation['size'][1])
+                            # 获取第一个 RLE 编码
+                            mask_np = mask_utils.decode(rle_obj[0])
+                        elif isinstance(counts, (str, bytes)):
+                            # 如果是字符串或 bytes 格式，直接解码
+                            mask_np = mask_utils.decode(segmentation)
+                        else:
+                            print(f"Warning: Unknown counts type: {type(counts)}")
+                            segment = None
+                            continue
+
                     elif isinstance(segmentation, list):
                         # Polygon format: [[x1, y1, x2, y2, ...], ...]
                         # Convert polygon to RLE, then decode
@@ -547,219 +578,9 @@ def create_coco_gt_from_dataset(dataset, image_ids=None, mask_resolution=288):
     return coco_gt
 
 
-def convert_predictions_to_coco_format_original_res(predictions_list, image_ids, dataset, model_resolution=288, score_threshold=0.0, merge_overlaps=True, iou_threshold=0.3, debug=False):
-    """
-    Convert model predictions to COCO format at ORIGINAL image resolution.
-
-    This matches the inference approach (infer_sam.py) where:
-    1. Masks are upsampled from 288x288 to original image size
-    2. Boxes are scaled to original image size
-    3. Evaluation happens at original resolution
-
-    Args:
-        predictions_list: List of predictions per image
-        image_ids: List of image IDs (indices into dataset)
-        dataset: Dataset to get original image sizes
-        model_resolution: Model output resolution (default: 288)
-        score_threshold: Confidence threshold
-        merge_overlaps: Whether to merge overlapping predictions
-        iou_threshold: IoU threshold for merging
-        debug: Print debug info
-    """
-    coco_predictions = []
-    pred_id = 0
-
-    if debug:
-        print(f"\n[DEBUG] Converting {len(predictions_list)} predictions to COCO format (ORIGINAL RESOLUTION)...")
-        if merge_overlaps:
-            print(f"[DEBUG] Overlapping segment merging ENABLED (IoU threshold={iou_threshold})")
-
-    for img_id, preds in zip(image_ids, predictions_list):
-        if preds is None or len(preds.get('pred_logits', [])) == 0:
-            continue
-
-        # Get original image size from dataset
-        datapoint = dataset[img_id]
-        orig_h, orig_w = datapoint.find_queries[0].inference_metadata.original_size
-
-        logits = preds['pred_logits']
-        boxes = preds['pred_boxes']
-        masks = preds['pred_masks']  # [N, 288, 288]
-
-        scores = torch.sigmoid(logits).squeeze(-1)
-
-        # Filter by score threshold
-        valid_mask = scores > score_threshold
-        num_before = len(scores)
-        scores = scores[valid_mask]
-        boxes = boxes[valid_mask]
-        masks = masks[valid_mask]
-
-        if debug and img_id == image_ids[0]:
-            print(f"[DEBUG] Image {img_id}: {num_before} queries -> {len(scores)} after filtering (threshold={score_threshold})")
-            if len(scores) > 0:
-                print(f"[DEBUG]   Original size: {orig_w}x{orig_h}")
-                print(f"[DEBUG]   Filtered scores: min={scores.min():.4f}, max={scores.max():.4f}, mean={scores.mean():.4f}")
-
-        if len(masks) == 0:
-            continue
-
-        # Upsample masks from 288x288 to original resolution (like infer_sam.py)
-        # Process on GPU then immediately move to CPU to save memory
-        masks_sigmoid = torch.sigmoid(masks)  # [N, 288, 288]
-        masks_upsampled = torch.nn.functional.interpolate(
-            masks_sigmoid.unsqueeze(1).float(),  # [N, 1, 288, 288]
-            size=(orig_h, orig_w),
-            mode='bilinear',
-            align_corners=False
-        ).squeeze(1)  # [N, orig_h, orig_w]
-
-        binary_masks = (masks_upsampled > 0.5).cpu()
-
-        # Free GPU memory immediately after upsampling
-        del masks_sigmoid, masks_upsampled
-        torch.cuda.empty_cache()
-
-        # Merge overlapping predictions
-        if merge_overlaps and len(binary_masks) > 0:
-            num_before_merge = len(binary_masks)
-            binary_masks, scores, boxes = merge_overlapping_masks(
-                binary_masks, scores.cpu(), boxes.cpu(), iou_threshold=iou_threshold
-            )
-            if debug and img_id == image_ids[0]:
-                print(f"[DEBUG]   Merged {num_before_merge} predictions -> {len(binary_masks)} (IoU threshold={iou_threshold})")
-
-        if len(binary_masks) > 0:
-            mask_areas = binary_masks.flatten(1).sum(1)
-
-            if debug and img_id == image_ids[0]:
-                print(f"[DEBUG]   Upsampled mask shape: {binary_masks.shape}")
-                print(f"[DEBUG]   Mask areas: min={mask_areas.min():.0f}, max={mask_areas.max():.0f}, mean={mask_areas.float().mean():.0f}")
-
-            rles = rle_encode(binary_masks)
-
-            for idx, (rle, score, box) in enumerate(zip(rles, scores.cpu().tolist(), boxes.cpu().tolist())):
-                # Convert box from normalized [0,1] to original image coordinates
-                cx, cy, w_norm, h_norm = box
-                x = (cx - w_norm/2) * orig_w
-                y = (cy - h_norm/2) * orig_h
-                w = w_norm * orig_w
-                h = h_norm * orig_h
-
-                # Clamp coordinates to image bounds
-                x = max(0, min(x, orig_w))
-                y = max(0, min(y, orig_h))
-                w = max(0, min(w, orig_w - x))
-                h = max(0, min(h, orig_h - y))
-
-                # Skip if box is too small after clamping
-                if w < 1 or h < 1:
-                    continue
-
-                pred_dict = {
-                    'image_id': int(img_id),
-                    'category_id': 1,
-                    'segmentation': rle,
-                    'bbox': [float(x), float(y), float(w), float(h)],
-                    'score': float(score),
-                    'id': pred_id
-                }
-
-                if debug and img_id == image_ids[0] and idx == 0:
-                    print(f"[DEBUG]   First prediction bbox (at {orig_w}x{orig_h}): {pred_dict['bbox']}")
-
-                coco_predictions.append(pred_dict)
-                pred_id += 1
-
-    return coco_predictions
-
-
-def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=False):
-    """
-    Create COCO ground truth dictionary from dataset at ORIGINAL resolution.
-
-    This matches the inference approach (infer_sam.py) where GT is kept
-    at original image size for evaluation.
-
-    Args:
-        dataset: Dataset with images and annotations
-        image_ids: List of image IDs to include (None = all)
-        debug: Print debug info
-    """
-    if debug:
-        print(f"\n[DEBUG] Creating COCO ground truth (ORIGINAL RESOLUTION)...")
-
-    coco_gt = {
-        'info': {
-            'description': 'SAM3 LoRA Validation Dataset',
-            'version': '1.0',
-            'year': 2024
-        },
-        'images': [],
-        'annotations': [],
-        'categories': [{'id': 1, 'name': 'object'}]
-    }
-
-    ann_id = 0
-    indices = range(len(dataset)) if image_ids is None else image_ids
-
-    for idx in indices:
-        datapoint = dataset[idx]
-
-        # Get original image size
-        orig_h, orig_w = datapoint.find_queries[0].inference_metadata.original_size
-
-        coco_gt['images'].append({
-            'id': int(idx),
-            'width': orig_w,
-            'height': orig_h,
-            'is_instance_exhaustive': True
-        })
-
-        for obj in datapoint.images[0].objects:
-            # Convert normalized CxCyWH box to COCO [x, y, w, h] at original size
-            cx, cy, bw, bh = obj.bbox.tolist()
-            w = bw * orig_w
-            h = bh * orig_h
-            x = cx * orig_w - w / 2
-            y = cy * orig_h - h / 2
-
-            ann = {
-                'id': ann_id,
-                'image_id': int(idx),
-                'category_id': 1,
-                'bbox': [x, y, w, h],
-                'area': w * h,
-                'iscrowd': 0,
-                'ignore': 0
-            }
-
-            if obj.segment is not None:
-                # Upsample mask from 1008x1008 to original size
-                mask_tensor = obj.segment.unsqueeze(0).unsqueeze(0).float()
-                upsampled_mask = torch.nn.functional.interpolate(
-                    mask_tensor,
-                    size=(orig_h, orig_w),
-                    mode='bilinear',
-                    align_corners=False
-                ) > 0.5
-
-                mask_np = upsampled_mask.squeeze().cpu().numpy().astype(np.uint8)
-                rle = mask_utils.encode(np.asfortranarray(mask_np))
-                rle['counts'] = rle['counts'].decode('utf-8')
-                ann['segmentation'] = rle
-
-            coco_gt['annotations'].append(ann)
-            ann_id += 1
-
-    if debug:
-        print(f"[DEBUG] Created {len(coco_gt['images'])} images, {len(coco_gt['annotations'])} annotations")
-        if len(coco_gt['annotations']) > 0:
-            sample_gt = coco_gt['annotations'][0]
-            sample_img = coco_gt['images'][0]
-            print(f"[DEBUG] Sample GT: image_id={sample_gt['image_id']}, bbox={sample_gt['bbox']}, image_size={sample_img['width']}x{sample_img['height']}")
-
-    return coco_gt
+def collate_fn(batch):
+    """Global collate function to avoid pickling issues with multiprocessing"""
+    return collate_fn_api(batch, dict_key="input", with_seg_masks=True)
 
 
 class SAM3TrainerNative:
@@ -913,9 +734,6 @@ class SAM3TrainerNative:
 
         if not has_validation:
             val_ds = None
-
-        def collate_fn(batch):
-            return collate_fn_api(batch, dict_key="input", with_seg_masks=True)
 
         # Create samplers for distributed training
         train_sampler = None
@@ -1226,7 +1044,6 @@ def launch_distributed_training(args):
 
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method('spawn', force=True)
     parser = argparse.ArgumentParser(
         description="Train SAM3 with LoRA",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1251,7 +1068,8 @@ Examples:
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/full_lora_config.yaml",
+        # default="configs/full_lora_config.yaml",
+        default="configs/light_lora_config.yaml",
         help="Path to YAML configuration file"
     )
     parser.add_argument(

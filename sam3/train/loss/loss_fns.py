@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
 
 import logging
+import os
 import warnings
 
 import torch
@@ -148,6 +149,10 @@ def sigmoid_focal_loss(
     Returns:
         Loss tensor
     """
+    # Disable Triton on Windows due to compilation issues
+    if os.name == 'nt':
+        triton = False
+    
     if not (0 <= alpha <= 1) and triton:
         raise RuntimeError(f"Alpha should be in [0,1], got {alpha}")
     if triton:
