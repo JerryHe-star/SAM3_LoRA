@@ -10,7 +10,7 @@ print("Testing Auxiliary Outputs Generation")
 print("="*60)
 
 # Initialize trainer
-trainer = SAM3TrainerNative('configs/full_lora_config.yaml')
+trainer = SAM3TrainerNative('configs/light_lora_config.yaml')
 
 # Create a small batch
 from torch.utils.data import DataLoader

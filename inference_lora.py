@@ -14,6 +14,11 @@ Usage:
         --output output.png
 """
 
+'''
+    python inference_lora.py         --config configs/light_lora_config.yaml         --weights outputs/sam3_lora_light/best_lora_weights.pt         --image E:/AI/Sam/dataset/UCIS4K/train/test_0001.jpg         --prompt "object to segment"         --output output.png
+
+'''
+
 import os
 import argparse
 import yaml
@@ -55,7 +60,8 @@ class SAM3LoRAInference:
         self.model = build_sam3_image_model(
             device=self.device.type,
             compile=False,
-            load_from_HF=True,
+            checkpoint_path = 'E:/AI/Sam/model/facebook/sam3/sam3.pt',
+            load_from_HF=False,
             bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
             eval_mode=True  # Set to eval mode for inference
         )
